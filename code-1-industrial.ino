@@ -733,3 +733,684 @@ void loop()
     }
   #endif
 }
+
+
+
+
+
+
+
+
+//slew----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include <esp_sleep.h>
+#include <esp_pm.h>
+
+// =====================================================
+// POWER MANAGEMENT CONFIGURATION
+// =====================================================
+
+#define ENABLE_POWER_SAVE 1
+#define LIGHT_SLEEP_TIMEOUT_MS 5000
+#define CPU_FREQ_MHZ 80  // Reduced from 240MHz to 80MHz
+
+// =====================================================
+// SLEW PINS
+// =====================================================
+
+#define LED1 8
+#define LED2 9
+#define LED3 10
+#define BTN1 13
+#define BTN2 5       // spare (not in use)
+
+// =====================================================
+// SETTINGS
+// =====================================================
+
+const unsigned long SEARCH_BLINK_TIME = 100;
+const unsigned long CONNECT_BLINK_TIME = 200;
+const unsigned long HELLO_INTERVAL = 500;
+const unsigned long HEARTBEAT_INTERVAL = 500;
+const unsigned long CONNECTION_TIMEOUT = 2500;
+const unsigned long DEBOUNCE_TIME = 40;
+const int CONNECT_BLINK_COUNT = 3;
+
+// =====================================================
+// MAC ADDRESSES
+// =====================================================
+
+// SLEW
+uint8_t SLEW_MAC[] = {
+  0x08, 0x3A, 0xF2, 0x09, 0xBE, 0xF8
+};
+
+// MASTER
+uint8_t MASTER_MAC[] = {
+  0x94, 0xA9, 0x90, 0xEF, 0x98, 0x28
+};
+
+#define ESPNOW_CHANNEL 1
+
+// =====================================================
+// MESSAGE TYPES
+// =====================================================
+
+#define MSG_HELLO       1
+#define MSG_HELLO_ACK   2
+#define MSG_HEARTBEAT   3
+#define MSG_BTN1_STATE  4
+#define MSG_RESET       5
+
+#define ROLE_MASTER 1
+#define ROLE_SLEW   2
+
+// =====================================================
+// PACKET
+// =====================================================
+
+typedef struct
+{
+  uint8_t type;
+  uint8_t role;
+  uint8_t buttonState;
+  uint32_t counter;
+} DataPacket;
+
+// =====================================================
+// SYSTEM STATES
+// =====================================================
+
+enum SystemState
+{
+  SEARCHING,
+  CONNECT_BLINK,
+  RESET_MODE,
+  NORMAL_OPERATION,
+  DISCONNECTED
+};
+
+SystemState systemState = SEARCHING;
+
+// =====================================================
+// TIMING VARIABLES
+// =====================================================
+
+unsigned long lastSearchBlink = 0;
+unsigned long lastConnectBlink = 0;
+unsigned long lastDisconnectBlink = 0;
+unsigned long lastPacket = 0;
+unsigned long lastHello = 0;
+unsigned long lastHeartbeat = 0;
+unsigned long lastActivityTime = 0;
+unsigned long lastLoopTime = 0;
+unsigned long lastBtnSendTime = 0;
+
+// =====================================================
+// STATE VARIABLES
+// =====================================================
+
+bool searchLED1 = true;
+bool connectLEDState = false;
+int connectBlinkCount = 0;
+bool disconnectLED1 = true;
+bool connected = false;
+bool slewBtn1Pressed = false;
+bool lastSlewBtn1State = false;
+
+// =====================================================
+// BUTTON VARIABLES
+// =====================================================
+
+bool lastBtn1 = HIGH;
+bool stableBtn1 = HIGH;
+unsigned long btn1Debounce = 0;
+bool lastBtn2 = HIGH;
+bool stableBtn2 = HIGH;
+unsigned long btn2Debounce = 0;
+
+// =====================================================
+// PERFORMANCE MONITORING
+// =====================================================
+
+unsigned long loopCount = 0;
+unsigned long lastStatsPrint = 0;
+
+// =====================================================
+// LED CONTROL
+// =====================================================
+
+inline void setSlewLEDs(bool led1, bool led2, bool led3)
+{
+  digitalWrite(LED1, led1 ? HIGH : LOW);
+  digitalWrite(LED2, led2 ? HIGH : LOW);
+  digitalWrite(LED3, led3 ? HIGH : LOW);
+}
+
+// =====================================================
+// POWER MANAGEMENT
+// =====================================================
+
+void configurePowerManagement()
+{
+  #if ENABLE_POWER_SAVE
+    // Reduce CPU frequency
+    esp_pm_config_t pm_config = {
+      .max_freq_mhz = CPU_FREQ_MHZ,
+      .min_freq_mhz = CPU_FREQ_MHZ,
+      .light_sleep_enable = true
+    };
+    esp_pm_configure(&pm_config);
+    
+    // Reduce WiFi power
+    esp_wifi_set_max_tx_power(40);  // 4dBm (minimum for stable connection)
+    
+    // Enable automatic light sleep
+    esp_sleep_enable_timer_wakeup(LIGHT_SLEEP_TIMEOUT_MS * 1000);
+    
+    Serial.println("Power Management Configured:");
+    Serial.printf("  CPU Frequency: %d MHz\n", CPU_FREQ_MHZ);
+    Serial.printf("  TX Power: %d dBm\n", 4);
+    Serial.printf("  Light Sleep Timeout: %d ms\n", LIGHT_SLEEP_TIMEOUT_MS);
+  #endif
+}
+
+// =====================================================
+// ENTER RESET MODE
+// =====================================================
+
+void enterResetMode()
+{
+  systemState = RESET_MODE;
+  slewBtn1Pressed = false;
+  
+  setSlewLEDs(false, true, false);
+  
+  Serial.println("\n================================");
+  Serial.println("READY - RESET MODE");
+  Serial.println("LED1 = OFF | LED2 = ON | LED3 = OFF");
+  Serial.println("================================");
+  
+  lastActivityTime = millis();
+}
+
+// =====================================================
+// START CONNECTION BLINK
+// =====================================================
+
+void startConnectionBlink()
+{
+  systemState = CONNECT_BLINK;
+  connectBlinkCount = 0;
+  connectLEDState = false;
+  lastConnectBlink = millis();
+  
+  setSlewLEDs(false, false, false);
+  
+  Serial.println("\n================================");
+  Serial.println("MASTER CONNECTED - INDICATING 3 BLINKS");
+  Serial.println("================================");
+  
+  lastActivityTime = millis();
+}
+
+// =====================================================
+// CONNECTION BLINK HANDLER
+// =====================================================
+
+inline void connectionBlinkIndication()
+{
+  if (systemState != CONNECT_BLINK) return;
+  
+  if (millis() - lastConnectBlink >= CONNECT_BLINK_TIME)
+  {
+    lastConnectBlink = millis();
+    connectLEDState = !connectLEDState;
+    
+    if (connectLEDState)
+    {
+      setSlewLEDs(true, true, false);
+    }
+    else
+    {
+      setSlewLEDs(false, false, false);
+      connectBlinkCount++;
+      
+      if (connectBlinkCount >= CONNECT_BLINK_COUNT)
+      {
+        enterResetMode();
+      }
+    }
+  }
+}
+
+// =====================================================
+// SEARCHING INDICATION
+// =====================================================
+
+inline void searchingIndication()
+{
+  if (systemState != SEARCHING) return;
+  
+  if (millis() - lastSearchBlink >= SEARCH_BLINK_TIME)
+  {
+    lastSearchBlink = millis();
+    searchLED1 = !searchLED1;
+    
+    setSlewLEDs(searchLED1, !searchLED1, false);
+  }
+}
+
+// =====================================================
+// DISCONNECT INDICATION
+// =====================================================
+
+inline void disconnectIndication()
+{
+  if (systemState != DISCONNECTED) return;
+  
+  if (millis() - lastDisconnectBlink >= SEARCH_BLINK_TIME)
+  {
+    lastDisconnectBlink = millis();
+    disconnectLED1 = !disconnectLED1;
+    
+    setSlewLEDs(disconnectLED1, !disconnectLED1, false);
+  }
+}
+
+// =====================================================
+// START DISCONNECT
+// =====================================================
+
+void startDisconnectMode()
+{
+  connected = false;
+  systemState = DISCONNECTED;
+  slewBtn1Pressed = false;
+  
+  disconnectLED1 = true;
+  lastDisconnectBlink = millis();
+  
+  setSlewLEDs(true, false, false);
+  
+  Serial.println("\n================================");
+  Serial.println("MASTER DISCONNECTED");
+  Serial.println("LED1 <-> LED2 | 100ms TIMER");
+  Serial.println("LED3 = OFF");
+  Serial.println("================================");
+  
+  lastActivityTime = millis();
+}
+
+// =====================================================
+// SEND TO MASTER (with retry)
+// =====================================================
+
+void sendToMaster(uint8_t type, uint8_t buttonState = 0)
+{
+  DataPacket packet;
+  packet.type = type;
+  packet.role = ROLE_SLEW;
+  packet.buttonState = buttonState;
+  packet.counter = millis();
+  
+  esp_err_t result = esp_now_send(MASTER_MAC, (uint8_t *)&packet, sizeof(packet));
+  
+  // Log errors but don't spam
+  static uint32_t lastErrorLog = 0;
+  if (result != ESP_OK && (millis() - lastErrorLog > 5000))
+  {
+    lastErrorLog = millis();
+    Serial.printf("ESP-NOW Send Error: %d\n", result);
+  }
+}
+
+// =====================================================
+// RECEIVE CALLBACK
+// =====================================================
+
+void onDataReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len)
+{
+  if (len != sizeof(DataPacket)) return;
+  if (memcmp(info->src_addr, MASTER_MAC, 6) != 0) return;
+  
+  DataPacket packet;
+  memcpy(&packet, data, sizeof(packet));
+  lastPacket = millis();
+  lastActivityTime = millis();
+  
+  // Process packet based on type
+  switch (packet.type)
+  {
+    case MSG_HELLO:
+      if (!connected)
+      {
+        connected = true;
+        startConnectionBlink();
+      }
+      sendToMaster(MSG_HELLO_ACK);
+      break;
+      
+    case MSG_HELLO_ACK:
+      if (!connected)
+      {
+        connected = true;
+        startConnectionBlink();
+      }
+      break;
+      
+    case MSG_HEARTBEAT:
+      if (!connected)
+      {
+        connected = true;
+        startConnectionBlink();
+      }
+      lastPacket = millis();
+      break;
+      
+    case MSG_RESET:
+      enterResetMode();
+      break;
+  }
+}
+
+// =====================================================
+// SEND BUTTON STATE
+// =====================================================
+
+void sendButtonState(bool pressed)
+{
+  sendToMaster(MSG_BTN1_STATE, pressed ? 1 : 0);
+  lastBtnSendTime = millis();
+  
+  // Update LED3 to show button status
+  digitalWrite(LED3, pressed ? HIGH : LOW);
+}
+
+// =====================================================
+// CHECK SLEW BUTTON 1
+// =====================================================
+
+void checkSlewButton1()
+{
+  bool reading = digitalRead(BTN1);
+  
+  if (reading != lastBtn1)
+  {
+    btn1Debounce = millis();
+  }
+  
+  if (millis() - btn1Debounce > DEBOUNCE_TIME)
+  {
+    if (reading != stableBtn1)
+    {
+      stableBtn1 = reading;
+      bool pressed = (stableBtn1 == LOW);
+      
+      if (pressed != slewBtn1Pressed)
+      {
+        slewBtn1Pressed = pressed;
+        
+        // Only send if connected or in normal operation
+        if (systemState == NORMAL_OPERATION || systemState == RESET_MODE)
+        {
+          sendButtonState(pressed);
+          
+          if (pressed)
+          {
+            Serial.println("SLEW BTN1 PRESSED - LED3 ON");
+          }
+          else
+          {
+            Serial.println("SLEW BTN1 RELEASED - LED3 OFF");
+          }
+        }
+        
+        lastActivityTime = millis();
+      }
+    }
+  }
+  
+  lastBtn1 = reading;
+}
+
+// =====================================================
+// CHECK SLEW BUTTON 2 (RESET)
+// =====================================================
+
+void checkSlewButton2()
+{
+  bool reading = digitalRead(BTN2);
+  
+  if (reading != lastBtn2)
+  {
+    btn2Debounce = millis();
+  }
+  
+  if (millis() - btn2Debounce > DEBOUNCE_TIME)
+  {
+    if (reading != stableBtn2)
+    {
+      stableBtn2 = reading;
+      
+      if (stableBtn2 == LOW)
+      {
+        Serial.println("\nSLEW RESET BUTTON PRESSED");
+        sendToMaster(MSG_RESET);
+        enterResetMode();
+        lastActivityTime = millis();
+      }
+    }
+  }
+  
+  lastBtn2 = reading;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n======================================");
+  Serial.println("       ESP-NOW SLEW (INDUSTRIAL)");
+  Serial.println("======================================");
+  
+  // Initialize pins
+  pinMode(LED1, OUTPUT);
+  pinMode(LED2, OUTPUT);
+  pinMode(LED3, OUTPUT);
+  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN2, INPUT_PULLUP);
+  
+  // Initial state
+  systemState = SEARCHING;
+  searchLED1 = true;
+  lastSearchBlink = millis();
+  setSlewLEDs(true, false, false);
+  
+  // Configure power management
+  configurePowerManagement();
+  
+  // Initialize WiFi
+  WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  
+  Serial.print("SLEW MAC: ");
+  Serial.println(WiFi.macAddress());
+  
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP-NOW INIT FAILED!");
+    while (true)
+    {
+      digitalWrite(LED1, HIGH);
+      delay(100);
+      digitalWrite(LED1, LOW);
+      delay(100);
+    }
+  }
+  
+  // Add MASTER peer
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, MASTER_MAC, 6);
+  peerInfo.channel = ESPNOW_CHANNEL;
+  peerInfo.encrypt = false;
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+  {
+    Serial.println("FAILED TO ADD MASTER");
+  }
+  else
+  {
+    Serial.println("MASTER PEER ADDED");
+  }
+  
+  esp_now_register_recv_cb(onDataReceive);
+  
+  Serial.println("ESP-NOW READY - SEARCHING FOR MASTER...");
+  lastActivityTime = millis();
+  lastLoopTime = millis();
+}
+
+// =====================================================
+// MAIN LOOP - OPTIMIZED FOR HEAT REDUCTION
+// =====================================================
+
+void loop()
+{
+  unsigned long currentTime = millis();
+  
+  // Process buttons with optimized timing
+  if (currentTime - lastLoopTime >= 5)  // 5ms minimum between checks
+  {
+    checkSlewButton1();
+    checkSlewButton2();
+    lastLoopTime = currentTime;
+  }
+  
+  // ===================================================
+  // STATE MACHINE WITH OPTIMIZED TIMING
+  // ===================================================
+  
+  switch (systemState)
+  {
+    case SEARCHING:
+      searchingIndication();
+      
+      if (currentTime - lastHello >= HELLO_INTERVAL)
+      {
+        lastHello = currentTime;
+        sendToMaster(MSG_HELLO);
+      }
+      
+      // Allow light sleep between operations
+      #if ENABLE_POWER_SAVE
+      if (currentTime - lastActivityTime > LIGHT_SLEEP_TIMEOUT_MS)
+      {
+        delay(1);  // Small delay to reduce CPU usage
+      }
+      #endif
+      break;
+      
+    case CONNECT_BLINK:
+      connectionBlinkIndication();
+      
+      if (currentTime - lastHeartbeat >= HEARTBEAT_INTERVAL)
+      {
+        lastHeartbeat = currentTime;
+        sendToMaster(MSG_HEARTBEAT);
+      }
+      break;
+      
+    case DISCONNECTED:
+      disconnectIndication();
+      
+      if (currentTime - lastHello >= HELLO_INTERVAL)
+      {
+        lastHello = currentTime;
+        sendToMaster(MSG_HELLO);
+      }
+      
+      #if ENABLE_POWER_SAVE
+      if (currentTime - lastActivityTime > LIGHT_SLEEP_TIMEOUT_MS)
+      {
+        delay(1);
+      }
+      #endif
+      break;
+      
+    case RESET_MODE:
+      setSlewLEDs(false, true, false);
+      
+      if (currentTime - lastHeartbeat >= HEARTBEAT_INTERVAL)
+      {
+        lastHeartbeat = currentTime;
+        sendToMaster(MSG_HEARTBEAT);
+      }
+      
+      if (currentTime - lastPacket > CONNECTION_TIMEOUT)
+      {
+        startDisconnectMode();
+      }
+      
+      #if ENABLE_POWER_SAVE
+      if (currentTime - lastActivityTime > LIGHT_SLEEP_TIMEOUT_MS)
+      {
+        delay(1);
+      }
+      #endif
+      break;
+      
+    case NORMAL_OPERATION:
+      // Normal connected state
+      setSlewLEDs(true, true, false);
+      
+      if (currentTime - lastHeartbeat >= HEARTBEAT_INTERVAL)
+      {
+        lastHeartbeat = currentTime;
+        sendToMaster(MSG_HEARTBEAT);
+      }
+      
+      if (currentTime - lastPacket > CONNECTION_TIMEOUT)
+      {
+        startDisconnectMode();
+      }
+      break;
+  }
+  
+  // ===================================================
+  // PERFORMANCE MONITORING (every 10 seconds)
+  // ===================================================
+  
+  loopCount++;
+  if (currentTime - lastStatsPrint > 10000)
+  {
+    lastStatsPrint = currentTime;
+    Serial.printf("Performance: %d loops/sec\n", loopCount / 10);
+    loopCount = 0;
+  }
+  
+  // ===================================================
+  // DELAY FOR HEAT REDUCTION
+  // ===================================================
+  
+  #if ENABLE_POWER_SAVE
+    // Small delay allows CPU to enter lower power state
+    if (systemState != NORMAL_OPERATION && systemState != CONNECT_BLINK)
+    {
+      delay(2);
+    }
+    else
+    {
+      delay(1);
+    }
+  #endif
+}
